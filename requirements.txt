@@ -1,0 +1,5 @@
+Flask>=3.0
+Flask-SocketIO>=5.3
+python-socketio>=5.10
+simple-websocket>=1.0
+gunicorn>=21.2
