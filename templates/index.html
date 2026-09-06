@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Sync Metronome</title>
+<title>Giganome</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
@@ -126,12 +126,19 @@
     align-items:center;
     padding:36px 0 28px;
   }
+  .pulse-stage{
+    position:relative;
+    width:150px;
+    height:150px;
+  }
   .pulse{
     width:150px; height:150px;
     border-radius:50%;
     border:2px solid var(--panel-line);
     display:flex; align-items:center; justify-content:center;
     position:relative;
+    z-index:2;
+    background:var(--bg);
     transition:transform .06s ease-out, border-color .06s ease-out, box-shadow .06s ease-out;
   }
   .pulse.beat{
@@ -143,10 +150,66 @@
     border-color:var(--green);
     box-shadow:0 0 34px 6px rgba(76,215,135,0.4);
   }
+  /* Sonar-style ring that expands outward from the pulse circle on every
+     beat, then fades and removes itself. Accent beats (beat 1 of the bar)
+     get the green ring so the downbeat is visually unmistakable. */
+  .ring{
+    position:absolute;
+    inset:0;
+    border-radius:50%;
+    border:2px solid var(--amber);
+    opacity:0.85;
+    pointer-events:none;
+    z-index:1;
+    animation: ringOut 0.55s ease-out forwards;
+  }
+  .ring.accent{ border-color:var(--green); border-width:2.5px; }
+  @keyframes ringOut{
+    from{ transform:scale(0.86); opacity:0.85; }
+    to{ transform:scale(2.1); opacity:0; }
+  }
+  /* Row of dots marking position within the bar — the active beat glows,
+     the downbeat glows green so you can always see where "beat 1" is. */
+  .beat-dots{
+    display:flex;
+    gap:9px;
+    justify-content:center;
+    margin-top:18px;
+  }
+  .beat-dot{
+    width:8px; height:8px;
+    border-radius:50%;
+    background:var(--panel-line);
+    transition:background .08s ease-out, transform .08s ease-out;
+  }
+  .beat-dot.active{
+    background:var(--amber);
+    transform:scale(1.6);
+  }
+  .beat-dot.active.accent{ background:var(--green); }
+  /* A small ticker that swings side to side once per beat, like the arm
+     of a mechanical metronome — purely decorative but reads instantly as
+     "tempo" at a glance from across a stage. */
+  .tick-track{
+    position:relative;
+    width:120px;
+    height:10px;
+    margin-top:14px;
+  }
+  .tick-dot{
+    position:absolute;
+    top:0; left:0;
+    width:10px; height:10px;
+    border-radius:50%;
+    background:var(--amber);
+    transition-property:left;
+    transition-timing-function:ease-in-out;
+  }
   .beat-count{
-    font-size:15px;
+    font-size:13px;
     color:var(--text-dim);
     font-family:'IBM Plex Mono', monospace;
+    margin-top:10px;
   }
   .bpm-readout{
     font-size:64px;
@@ -251,6 +314,20 @@
     text-decoration:underline;
   }
 
+  .footer{
+    margin-top:28px;
+    padding-top:16px;
+    border-top:1px solid var(--panel-line);
+    text-align:center;
+    font-size:12px;
+    color:var(--text-dim);
+  }
+  .footer a{
+    color:var(--text-dim);
+    text-decoration:underline;
+  }
+  .footer a:hover{ color:var(--amber); }
+
   @media (prefers-reduced-motion: reduce){
     .pulse{ transition:none; }
   }
@@ -261,7 +338,7 @@
 <div class="rig">
 
   <div class="nameplate">
-    <h1>Sync Metronome</h1>
+    <h1>Giganome</h1>
     <div class="status-line"><span class="status-dot" id="statusDot"></span><span id="statusText">offline</span></div>
   </div>
 
@@ -270,7 +347,7 @@
     <div class="home-actions">
       <button class="big-btn" id="createBtn">
         Start a session
-        <small>You control the tempo — your bandmates follow.</small>
+        <small>You control the tempo > your bandmates follow.</small>
       </button>
 
       <div class="big-btn" style="cursor:default;">
@@ -294,13 +371,17 @@
     </div>
 
     <div class="pulse-wrap">
-      <div class="pulse" id="pulse">
-        <div>
-          <div class="bpm-readout" id="bpmReadout">120</div>
-          <div class="bpm-label">BPM</div>
+      <div class="pulse-stage" id="pulseStage">
+        <div class="pulse" id="pulse">
+          <div>
+            <div class="bpm-readout" id="bpmReadout">120</div>
+            <div class="bpm-label">BPM</div>
+          </div>
         </div>
       </div>
-      <div class="beat-count" id="beatCount" style="margin-top:14px;">— / 4</div>
+      <div class="beat-dots" id="beatDots"></div>
+      <div class="tick-track"><div class="tick-dot" id="tickDot"></div></div>
+      <div class="beat-count" id="beatCount">— / 4</div>
     </div>
 
     <div id="waitingText" class="waiting-text hidden">Waiting for the host to start…</div>
@@ -343,6 +424,10 @@
     <button class="leave-link" id="leaveBtn">Leave session</button>
   </div>
 
+  <footer class="footer">
+    Developed by <a href="LINKEDINedin.com/in/rudranil-goswami-a94298329/" target="_blank" rel="noopener">Rudranil Goswami</a>
+  </footer>
+
 </div>
 
 <script>
@@ -379,6 +464,9 @@ const joinError = document.getElementById('joinError');
 const codeValue = document.getElementById('codeValue');
 const codeDisplay = document.getElementById('codeDisplay');
 const pulse = document.getElementById('pulse');
+const pulseStage = document.getElementById('pulseStage');
+const beatDotsEl = document.getElementById('beatDots');
+const tickDot = document.getElementById('tickDot');
 const bpmReadout = document.getElementById('bpmReadout');
 const beatCountEl = document.getElementById('beatCount');
 const waitingText = document.getElementById('waitingText');
@@ -485,6 +573,8 @@ function startScheduler(serverStartTime, newBpm, newBeatsPerBar) {
   bpm = newBpm;
   beatsPerBar = newBeatsPerBar;
   secondsPerBeat = 60 / bpm;
+  renderBeatDots();
+  tickDot.style.transitionDuration = secondsPerBeat + 's';
 
   const localStartEpoch = serverStartTime - clockOffset;
   const startAudioTime = epochToAudioTime(localStartEpoch);
@@ -520,6 +610,11 @@ function stopScheduler() {
   visualQueue = [];
   pulse.classList.remove('beat', 'accent');
   beatCountEl.textContent = `— / ${beatsPerBar}`;
+  Array.from(beatDotsEl.children).forEach((d) => d.classList.remove('active', 'accent'));
+  pulseStage.querySelectorAll('.ring').forEach((r) => r.remove());
+  tickDot.style.transitionDuration = '0s';
+  tickDot.style.left = '0px';
+  tickSide = false;
 }
 
 function visualLoop() {
@@ -530,11 +625,43 @@ function visualLoop() {
   rafHandle = requestAnimationFrame(visualLoop);
 }
 
+function renderBeatDots() {
+  beatDotsEl.innerHTML = '';
+  for (let i = 0; i < beatsPerBar; i++) {
+    const d = document.createElement('div');
+    d.className = 'beat-dot';
+    beatDotsEl.appendChild(d);
+  }
+}
+
+function spawnRing(accent) {
+  const ring = document.createElement('div');
+  ring.className = 'ring' + (accent ? ' accent' : '');
+  pulseStage.appendChild(ring);
+  ring.addEventListener('animationend', () => ring.remove());
+}
+
+let tickSide = false;
+function swingTick() {
+  tickSide = !tickSide;
+  tickDot.style.left = tickSide ? 'calc(100% - 10px)' : '0px';
+}
+
 let flashTimeout = null;
 function flashPulse(accent, beatNum) {
   pulse.classList.add('beat');
   pulse.classList.toggle('accent', accent);
   beatCountEl.textContent = `${beatNum} / ${beatsPerBar}`;
+  spawnRing(accent);
+  swingTick();
+
+  const dots = beatDotsEl.children;
+  for (let i = 0; i < dots.length; i++) {
+    const isCurrent = i === beatNum - 1;
+    dots[i].classList.toggle('active', isCurrent);
+    dots[i].classList.toggle('accent', isCurrent && accent);
+  }
+
   clearTimeout(flashTimeout);
   flashTimeout = setTimeout(() => pulse.classList.remove('beat', 'accent'), 90);
 }
@@ -565,6 +692,7 @@ function showSessionScreen() {
   bpmSlider.value = bpm;
   bpmStepperVal.textContent = bpm;
   renderSigOptions();
+  renderBeatDots();
 
   if (isHost) {
     hostControls.classList.remove('hidden');
