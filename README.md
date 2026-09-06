@@ -1,9 +1,24 @@
-# Sync Metronome
+# Giganome
 
 A metronome that keeps a whole band's phones/laptops clicking on the same
-beat, over the same Wi-Fi network. One person hosts (sets BPM + time
-signature, hits Start); everyone else joins with a 4-character code and
-follows automatically.
+beat. One person hosts (sets BPM + time signature, hits Start); everyone
+else joins with a 4-character code and follows automatically — no one
+needs to know what "hosting a server" means.
+
+## Local WiFi Direct — no setup required
+
+Deployed to Render as usual, everyone joins over the internet with the
+same 4-character code — nothing changes there. But the moment two
+devices are in the same session, the app quietly tries to open a direct
+browser-to-browser connection between them (WebRTC) in the background.
+If those devices happen to share a Wi-Fi network (a venue's WiFi, or one
+band member's phone hotspot), that direct connection runs over the LAN,
+and the host becomes the live timing reference for that device instead
+of Render — cutting the sync error down from "internet round-trip" to
+"a few milliseconds," which is what actually removes the count-or-two
+of drag. Nobody sets anything up for this: it's automatic, and if it
+can't connect directly (different networks, a strict firewall) the app
+just keeps using the normal Render-relayed sync, unchanged.
 
 ## How the sync actually works
 
