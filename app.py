@@ -1,7 +1,8 @@
 """
-Sync Metronome — server
+Giganome — server
 ------------------------
-Acts purely as a *sync authority*. It never plays audio itself — it just:
+Acts purely as a *sync authority and matchmaker*. It never plays audio
+itself — it just:
   1. Manages sessions (rooms) identified by a short join code.
   2. Relays tempo / time-signature / start / stop commands from the host
      to everyone else in the room.
@@ -9,6 +10,15 @@ Acts purely as a *sync authority*. It never plays audio itself — it just:
      server time. All actual click scheduling happens client-side using
      the Web Audio API, which is far more precise than anything we could
      do by pushing "beat" events over the network one at a time.
+  4. Relays WebRTC handshake messages (offer/answer/ICE) between the
+     host and each member. Once that handshake completes, the host and
+     that member open a direct browser-to-browser connection. If they
+     happen to share a Wi-Fi network, that connection runs over the LAN
+     with near-zero latency — the host becomes the timing reference for
+     that peer instead of this server, automatically, with nothing for
+     either person to configure. If a direct connection can't be made
+     (different networks, restrictive firewall), everything transparently
+     keeps working through this server exactly as before.
 
 Run:
     pip install -r requirements.txt
@@ -100,6 +110,8 @@ def on_disconnect():
         sessions.pop(code, None)
     else:
         emit("member_update", {"member_count": len(session["members"])}, room=code)
+        # Tell the host so it can tear down that peer's WebRTC connection.
+        emit("peer_left", {"sid": sid}, room=session["host_sid"])
 
 
 @socketio.on("create_session")
@@ -137,8 +149,15 @@ def on_join_session(data):
     session["members"].add(sid)
     clients[sid] = {"code": code, "is_host": False}
     join_room(code)
-    emit("session_joined", {"code": code, "is_host": False, **public_state(session)})
+    emit(
+        "session_joined",
+        {"code": code, "is_host": False, "host_sid": session["host_sid"], **public_state(session)},
+    )
     emit("member_update", {"member_count": len(session["members"])}, room=code)
+    # Let the host know a new peer showed up so it can open a direct
+    # WebRTC connection to them (see webrtc_signal below). Sent only to
+    # the host, not the whole room.
+    emit("peer_joined", {"sid": sid}, room=session["host_sid"])
 
 
 def _get_host_session(sid):
@@ -228,6 +247,30 @@ def on_stop(data):
     emit("playback_stopped", {}, room=code)
 
 
+@socketio.on("webrtc_signal")
+def on_webrtc_signal(data):
+    """Pure relay for WebRTC handshake messages (offer/answer/ICE candidates)
+    between two peers in the same session. The server never looks at or
+    stores the payload — it's just a mailbox so two browsers on the same
+    Wi-Fi network can find each other and then talk directly, peer to
+    peer, without their tempo/clock-sync traffic touching this server at
+    all. This is what lets Giganome fall back to near-zero-latency local
+    sync automatically whenever devices share a network, with no manual
+    hosting step required."""
+    from flask import request
+
+    sid = request.sid
+    target = (data or {}).get("target")
+    info = clients.get(sid)
+    target_info = clients.get(target)
+    if not info or not target_info or info["code"] != target_info["code"]:
+        return  # ignore cross-session or unknown targets
+
+    payload = dict(data or {})
+    payload["from"] = sid
+    emit("webrtc_signal", payload, room=target)
+
+
 @socketio.on("sync_ping")
 def on_sync_ping(data):
     from flask import request
@@ -241,7 +284,7 @@ if __name__ == "__main__":
     # Local development only. In production (Render/Railway), gunicorn's
     # eventlet worker runs this app instead — see Procfile.
     port = int(os.environ.get("PORT", 5000))
-    print(f"Sync Metronome server starting on http://0.0.0.0:{port}")
+    print(f"Giganome server starting on http://0.0.0.0:{port}")
     print("Find this machine's LAN IP (e.g. `ipconfig` / `ifconfig`) and share")
     print(f"http://<that-ip>:{port} with your bandmates on the same Wi-Fi.")
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
