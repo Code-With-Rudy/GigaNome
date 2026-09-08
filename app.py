@@ -1,5 +1,5 @@
 """
-Giganome — server 3.0 (developed by Rudranil Goswami)
+Giganome 3.0 — server (developed by Rudranil Goswami)
 ------------------------
 Acts purely as a *sync authority and matchmaker*. It never plays audio
 itself — it just:
