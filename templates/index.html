@@ -706,7 +706,7 @@ function applyHostTransport(msg) {
   renderSigOptions();
   refreshTransportUI();
   if (isPlaying && msg.start_time != null) {
-    scheduleFromRemote(msg.start_time, hostClockOffset, bpm, beatsPerBar);
+    scheduleFromRemote(msg.start_time, 'host', bpm, beatsPerBar);
     if (!wasPlaying) beginCountIn(msg.start_time, 'host'); // only the initial start gets the full count-in treatment
   } else if (!isPlaying) {
     stopScheduler();
@@ -797,23 +797,33 @@ function playClick(time, accent) {
 }
 
 function startScheduler(serverStartTime, newBpm, newBeatsPerBar) {
-  scheduleFromRemote(serverStartTime, clockOffset, newBpm, newBeatsPerBar);
+  scheduleFromRemote(serverStartTime, 'server', newBpm, newBeatsPerBar);
 }
 
-// offset lets this same scheduler serve two clock domains: `clockOffset`
-// (relative to the Render server) for the fallback path, or
-// `hostClockOffset` (relative to the host's own device) for the fast
-// local-WiFi path — see the WebRTC section above.
-function scheduleFromRemote(remoteEpochMs, offset, newBpm, newBeatsPerBar) {
+// `domain` says whose clock remoteEpochMs is expressed in — 'self' (no
+// translation needed, host scheduling its own transport), 'host' (a
+// member synced directly to the host over WebRTC/local WiFi), or
+// 'server' (the Render fallback path). We re-resolve the domain to a
+// live offset via getActiveOffset() every time we (re)anchor, instead
+// of freezing a number at call time, so periodic drift correction below
+// can call this same lookup again later with a *freshly measured*
+// offset rather than a stale one.
+//
+// `playAnchor` remembers what we last anchored to, so driftCorrect()
+// can keep re-deriving "what nextBeatTime *should* be" for as long as
+// playback continues — not just during the pre-roll count-in.
+let playAnchor = null;
+
+function scheduleFromRemote(remoteEpochMs, domain, newBpm, newBeatsPerBar) {
   stopScheduler();
   bpm = newBpm;
   beatsPerBar = newBeatsPerBar;
   secondsPerBeat = 60 / bpm;
   renderBeatDots();
   tickDot.style.transitionDuration = secondsPerBeat + 's';
+  playAnchor = { remoteEpochMs, domain, bpm, beatsPerBar };
 
-  const localStartEpoch = remoteEpochMs - offset;
-  const startAudioTime = epochToAudioTime(localStartEpoch);
+  const startAudioTime = targetAudioStartTime(remoteEpochMs, domain);
   const now = audioCtx.currentTime;
 
   if (now < startAudioTime) {
@@ -840,9 +850,52 @@ function scheduleFromRemote(remoteEpochMs, offset, newBpm, newBeatsPerBar) {
   if (!rafHandle) visualLoop();
 }
 
+// Converts a target wall-clock instant into this device's own AudioContext
+// timeline, compensating for this device's *output* latency (Bluetooth
+// speakers/headphones commonly add 100–300ms of their own delay after the
+// audio leaves the Web Audio graph — no amount of network clock sync can
+// fix that, only knowing about it can). outputLatency isn't available in
+// every browser, so this degrades gracefully to 0 where it's missing.
+function targetAudioStartTime(remoteEpochMs, domain) {
+  const offset = getActiveOffset(domain);
+  const localStartEpoch = remoteEpochMs - offset;
+  const outputLatency = (audioCtx.outputLatency || audioCtx.baseLatency || 0);
+  return epochToAudioTime(localStartEpoch) - outputLatency;
+}
+
+// ---- Continuous drift correction (runs for the whole performance, not
+// just the count-in) ----
+// The count-in only tightens the *offset* estimate right up to the
+// downbeat; it says nothing about what happens for the next several
+// minutes of playing. Two things drift after that: the network offset
+// itself (routes/latency shift), and — more importantly for a live set —
+// the AudioContext's own hardware clock, which is not perfectly locked to
+// the system clock (Date.now()) and can run a few hundred ppm fast or
+// slow depending on the device. Left uncorrected, that alone is enough to
+// pull two phones audibly apart over the course of a song.
+//
+// Every few seconds we recompute where the beat grid *should* be from the
+// original anchor plus the latest offset, and nudge nextBeatTime toward
+// it by a tiny, capped amount — small enough to never be heard as a
+// glitch, applied often enough that drift never has room to build up.
+const DRIFT_CHECK_MS = 6000;
+const MAX_DRIFT_NUDGE_SEC = 0.003; // 3ms per check — inaudible, ~0.5ms/sec max correction rate
+
+function driftCorrect() {
+  if (!isPlaying || !playAnchor || !schedulerTimer) return;
+  const idealStart = targetAudioStartTime(playAnchor.remoteEpochMs, playAnchor.domain);
+  const beatsSoFar = Math.round((nextBeatTime - idealStart) / secondsPerBeat);
+  const idealNextBeatTime = idealStart + beatsSoFar * secondsPerBeat;
+  const drift = idealNextBeatTime - nextBeatTime;
+  const nudge = Math.max(-MAX_DRIFT_NUDGE_SEC, Math.min(MAX_DRIFT_NUDGE_SEC, drift));
+  nextBeatTime += nudge;
+}
+setInterval(driftCorrect, DRIFT_CHECK_MS);
+
 function stopScheduler() {
   if (schedulerTimer) clearInterval(schedulerTimer);
   schedulerTimer = null;
+  playAnchor = null;
   visualQueue = [];
   pulse.classList.remove('beat', 'accent');
   beatCountEl.textContent = `— / ${beatsPerBar}`;
@@ -916,7 +969,7 @@ function renderSigOptions() {
       let hostStart = null;
       if (isPlaying) {
         hostStart = Date.now() + START_BUFFER_MS;
-        scheduleFromRemote(hostStart, 0, bpm, beatsPerBar);
+        scheduleFromRemote(hostStart, 'self', bpm, beatsPerBar);
       }
       broadcastTransportToPeers(hostStart);
       socket.emit('set_time_signature', { beats_per_bar: num, beat_unit: unit });
@@ -1012,9 +1065,8 @@ function refineDuringCountIn(remoteEpochMs, domain) {
   const resync = domain === 'host' ? startHostClockSync(4) : syncClock(4);
   resync.then(() => {
     if (!isPlaying) return;
-    const newOffset = getActiveOffset(domain);
-    countInLocalStart = remoteEpochMs - newOffset;
-    scheduleFromRemote(remoteEpochMs, newOffset, bpm, beatsPerBar);
+    countInLocalStart = remoteEpochMs - getActiveOffset(domain);
+    scheduleFromRemote(remoteEpochMs, domain, bpm, beatsPerBar);
     refineDuringCountIn(remoteEpochMs, domain);
   });
 }
@@ -1057,7 +1109,7 @@ function applyTempoChange(v) {
   let hostStart = null;
   if (isPlaying) {
     hostStart = Date.now() + START_BUFFER_MS;
-    scheduleFromRemote(hostStart, 0, bpm, beatsPerBar);
+    scheduleFromRemote(hostStart, 'self', bpm, beatsPerBar);
   }
   broadcastTransportToPeers(hostStart);
   socket.emit('set_tempo', { bpm: v });
@@ -1088,7 +1140,7 @@ startBtn.onclick = () => {
   const hostStart = Date.now() + START_COUNT_IN_MS;
   isPlaying = true;
   refreshTransportUI();
-  scheduleFromRemote(hostStart, 0, bpm, beatsPerBar); // host's own clock — exact, no network wait
+  scheduleFromRemote(hostStart, 'self', bpm, beatsPerBar); // host's own clock — exact, no network wait
   beginCountIn(hostStart, 'self');
   broadcastTransportToPeers(hostStart);
   socket.emit('start', {}); // fallback path for anyone not on a direct connection
