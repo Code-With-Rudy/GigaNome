@@ -338,7 +338,7 @@
 <div class="rig">
 
   <div class="nameplate">
-    <h1>Giganome</h1>
+    <h1>Giganome 3.0</h1>
     <div class="status-line"><span class="status-dot" id="statusDot"></span><span id="statusText">offline</span></div>
   </div>
 
@@ -385,6 +385,7 @@
     </div>
 
     <div id="waitingText" class="waiting-text hidden">Waiting for the host to start…</div>
+    <div id="countInText" class="waiting-text hidden mono"></div>
 
     <!-- Host-only controls -->
     <div id="hostControls" class="hidden">
@@ -470,6 +471,7 @@ const tickDot = document.getElementById('tickDot');
 const bpmReadout = document.getElementById('bpmReadout');
 const beatCountEl = document.getElementById('beatCount');
 const waitingText = document.getElementById('waitingText');
+const countInText = document.getElementById('countInText');
 const hostControls = document.getElementById('hostControls');
 const guestInfo = document.getElementById('guestInfo');
 const memberCount = document.getElementById('memberCount');
@@ -506,7 +508,8 @@ const SIG_PRESETS = [[2,4],[3,4],[4,4],[5,4],[6,8],[7,8]];
    (different networks, a strict firewall), the app quietly keeps
    using the normal server-relayed path above — nothing breaks.
    ========================================================= */
-const START_BUFFER_MS = 1500; // matches the server's lead time, for host-originated schedules
+const START_BUFFER_MS = 1500; // lead time for mid-performance tempo/signature re-anchors
+const START_COUNT_IN_MS = 10000; // lead time for the initial Start — long enough to lock the clock offset in tight before the downbeat, per the "10 second count-in" idea
 const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 let peerConnections = {};   // sid -> RTCPeerConnection
 let dataChannels = {};      // sid -> RTCDataChannel
@@ -651,17 +654,21 @@ function handleDataChannelMessage(remoteSid, msg) {
 let hostSyncBest = null;
 let hostSyncDone = 0;
 let hostSyncTotal = 0;
+let hostSyncResolve = null;
 
 function startHostClockSync(numSamples) {
-  hostSyncBest = null;
-  hostSyncDone = 0;
-  hostSyncTotal = numSamples;
-  sendHostPing();
+  return new Promise((resolve) => {
+    hostSyncBest = null;
+    hostSyncDone = 0;
+    hostSyncTotal = numSamples;
+    hostSyncResolve = resolve;
+    sendHostPing();
+  });
 }
 
 function sendHostPing() {
   const dc = dataChannels[hostSid];
-  if (!dc || dc.readyState !== 'open') return;
+  if (!dc || dc.readyState !== 'open') { if (hostSyncResolve) { hostSyncResolve(); hostSyncResolve = null; } return; }
   dc.send(JSON.stringify({ type: 'ping', t0: Date.now() }));
 }
 
@@ -676,6 +683,7 @@ function handleHostPong(msg) {
     hostClockOffset = hostSyncBest.offset;
     p2pConnected = true;
     updateP2PStatus(hostSyncBest.rtt);
+    if (hostSyncResolve) { hostSyncResolve(); hostSyncResolve = null; }
   } else {
     setTimeout(sendHostPing, 100);
   }
@@ -689,6 +697,7 @@ setInterval(() => {
 
 // ---- Host-side: apply a transport update sent directly over the wire ----
 function applyHostTransport(msg) {
+  const wasPlaying = isPlaying;
   bpm = msg.bpm;
   beatsPerBar = msg.beats_per_bar;
   beatUnit = msg.beat_unit;
@@ -698,8 +707,10 @@ function applyHostTransport(msg) {
   refreshTransportUI();
   if (isPlaying && msg.start_time != null) {
     scheduleFromRemote(msg.start_time, hostClockOffset, bpm, beatsPerBar);
+    if (!wasPlaying) beginCountIn(msg.start_time, 'host'); // only the initial start gets the full count-in treatment
   } else if (!isPlaying) {
     stopScheduler();
+    endCountIn();
   }
 }
 
@@ -948,6 +959,66 @@ function refreshTransportUI() {
   }
 }
 
+// ============ Count-in ============
+/* The 10-second lead time on Start isn't just a safety margin — every
+   device uses it to keep re-running clock sync (against the host
+   directly if on local WiFi, against the server otherwise) right up
+   until just before the downbeat, so the offset it schedules from is
+   the freshest, tightest estimate possible rather than one taken up to
+   25s ago. Nothing audible happens until the count-in reaches zero, so
+   re-scheduling mid-countdown is silent and safe. */
+let countInTimer = null;
+let countInLocalStart = null;
+
+function getActiveOffset(domain) {
+  if (domain === 'self') return 0;
+  if (domain === 'host') return hostClockOffset;
+  return clockOffset;
+}
+
+function beginCountIn(remoteEpochMs, domain) {
+  endCountIn();
+  countInLocalStart = remoteEpochMs - getActiveOffset(domain);
+  countInText.classList.remove('hidden');
+  updateCountInText();
+  countInTimer = setInterval(updateCountInText, 100);
+  if (domain !== 'self') refineDuringCountIn(remoteEpochMs, domain);
+}
+
+function updateCountInText() {
+  if (countInLocalStart == null) return;
+  const remaining = (countInLocalStart - Date.now()) / 1000;
+  if (remaining <= 0) {
+    endCountIn();
+    return;
+  }
+  countInText.textContent = `Starting in ${remaining.toFixed(1)}s…`;
+}
+
+function endCountIn() {
+  if (countInTimer) clearInterval(countInTimer);
+  countInTimer = null;
+  countInLocalStart = null;
+  countInText.classList.add('hidden');
+}
+
+function refineDuringCountIn(remoteEpochMs, domain) {
+  const localStart = remoteEpochMs - getActiveOffset(domain);
+  const msUntilStart = localStart - Date.now();
+  // Stop refining with margin to spare so the very last resync can't
+  // land a reschedule right on top of the downbeat itself.
+  if (msUntilStart < 900 || !isPlaying) return;
+
+  const resync = domain === 'host' ? startHostClockSync(4) : syncClock(4);
+  resync.then(() => {
+    if (!isPlaying) return;
+    const newOffset = getActiveOffset(domain);
+    countInLocalStart = remoteEpochMs - newOffset;
+    scheduleFromRemote(remoteEpochMs, newOffset, bpm, beatsPerBar);
+    refineDuringCountIn(remoteEpochMs, domain);
+  });
+}
+
 // ============ Actions ============
 createBtn.onclick = async () => {
   initAudio();
@@ -1014,16 +1085,18 @@ bpmUp.onclick = () => {
 };
 
 startBtn.onclick = () => {
-  const hostStart = Date.now() + START_BUFFER_MS;
+  const hostStart = Date.now() + START_COUNT_IN_MS;
   isPlaying = true;
   refreshTransportUI();
   scheduleFromRemote(hostStart, 0, bpm, beatsPerBar); // host's own clock — exact, no network wait
+  beginCountIn(hostStart, 'self');
   broadcastTransportToPeers(hostStart);
   socket.emit('start', {}); // fallback path for anyone not on a direct connection
 };
 stopBtn.onclick = () => {
   isPlaying = false;
   refreshTransportUI();
+  endCountIn();
   broadcastTransportToPeers(null);
   socket.emit('stop', {});
 };
@@ -1100,22 +1173,26 @@ socket.on('playback_started', (data) => {
   setLocalBpmDisplay(bpm);
   refreshTransportUI();
   startScheduler(data.start_time, bpm, beatsPerBar);
+  beginCountIn(data.start_time, 'server');
 });
 
 socket.on('playback_stopped', () => {
   if (isHost || p2pConnected) return;
   isPlaying = false;
   refreshTransportUI();
+  endCountIn();
 });
 
 socket.on('session_ended', (data) => {
   cleanupAllPeers();
+  endCountIn();
   alert(data.reason || 'Session ended.');
   location.reload();
 });
 
 socket.on('disconnect', () => {
   cleanupAllPeers();
+  endCountIn();
   statusDot.classList.remove('synced');
   statusText.textContent = 'offline';
 });
