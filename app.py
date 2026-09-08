@@ -1,5 +1,5 @@
 """
-Giganome — server
+Giganome — server 3.0 (developed by Rudranil Goswami)
 ------------------------
 Acts purely as a *sync authority and matchmaker*. It never plays audio
 itself — it just:
@@ -53,7 +53,8 @@ sessions = {}
 clients = {}
 
 CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # no 0/O/1/I/L — easy to read aloud
-START_BUFFER_MS = 1500  # lead time given to clients to schedule the first beat
+START_BUFFER_MS = 1500  # lead time for mid-performance tempo/signature re-anchors
+START_COUNT_IN_MS = 10000  # lead time for the initial Start, matching the client's count-in
 
 
 def now_ms():
@@ -222,7 +223,7 @@ def on_start(data):
     if not session:
         return
     session["playing"] = True
-    session["start_time"] = now_ms() + START_BUFFER_MS
+    session["start_time"] = now_ms() + START_COUNT_IN_MS
     emit(
         "playback_started",
         {
